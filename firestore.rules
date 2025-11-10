@@ -1,0 +1,113 @@
+
+/**
+ * @fileOverview Firestore Security Rules for CampusExaminer application.
+ *
+ * Core Philosophy:
+ * This ruleset enforces a user-ownership model for user profiles and exam creation,
+ * and restricts access to student exam records based on student ID. It allows
+ * authenticated users to read exam data, as specific filtering is handled client-side.
+ * It also includes a 'super-admin' role with full database access.
+ */
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // --- Helper Functions ---
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    // Function to check if the user has a 'faculty' role.
+    function isFaculty() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'faculty';
+    }
+    
+    // Function to check if the user has a 'super-admin' role.
+    function isSuperAdmin() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'super-admin';
+    }
+    
+    // Function to check if the user is the owner of a document.
+    function isOwner(userId) {
+      return request.auth.uid == userId;
+    }
+
+    // --- Universal Super Admin Rule ---
+    // A super-admin can read and write any document in the database.
+    match /{path=**} {
+      allow read, write: if isSignedIn() && isSuperAdmin();
+    }
+
+    // --- Collection Rules ---
+
+    // Users can only manage their own profile.
+    match /users/{userId} {
+      allow read, update, delete: if isSignedIn() && isOwner(userId);
+      // Anyone signed in can create their own user profile document.
+      allow create: if isSignedIn() && isOwner(userId);
+    }
+
+    // Only faculty or super-admins can list all users.
+    match /users/{userId} {
+        allow list: if isSignedIn() && (isFaculty() || isSuperAdmin());
+    }
+
+    // Exams are readable by any authenticated user, but only writable by faculty or super-admins.
+    match /exams/{examId} {
+      allow read: if isSignedIn(); // Allows get and list for all signed-in users
+      allow write: if isSignedIn() && (isFaculty() || isSuperAdmin()); // Create, update, delete for faculty and super-admin
+      
+      // Rules for the student roster of an exam.
+      match /roster/{studentId} {
+        // Faculty or super-admins can manage the roster.
+        allow read, write: if isSignedIn() && (isFaculty() || isSuperAdmin());
+        // Students can read their own roster entry to check for access.
+        allow get: if isSignedIn() && isOwner(studentId);
+      }
+    }
+    
+    // Rules for student exam submissions.
+    match /studentExams/{studentExamId} {
+      // Allow a student to get their own submission.
+      // Allow faculty or super-admin to get any submission.
+      allow get: if isSignedIn() && (isOwner(resource.data.studentId) || isOwner(studentExamId.split('_')[0]) || isFaculty() || isSuperAdmin());
+
+      // Allow students to create their own submission record.
+      // The studentExamId should be in the format {studentId}_{examId}.
+      allow create: if isSignedIn() && isOwner(request.resource.data.studentId);
+                      
+      // Allow students to update their own submission if it's not finalized.
+      // Allow faculty or super-admin to update any submission (for grading).
+      allow update: if isSignedIn() && 
+                      (
+                        isFaculty() || isSuperAdmin() ||
+                        (
+                          // Student is the owner of the document
+                          isOwner(request.resource.data.studentId) &&
+                          // The document must not exist yet (for initial save) OR its status must not be final
+                          (!exists(/databases/$(database)/documents/studentExams/$(studentExamId)) || 
+                           (resource.data.status != 'graded' && resource.data.status != 'suspicious')) &&
+                          // Student cannot change the studentId once it's set
+                          request.resource.data.studentId == resource.data.studentId &&
+                          // Allow writing score on initial graded submission, but not modification afterwards
+                          (!('score' in resource.data.keys()) || request.resource.data.score == resource.data.score) &&
+                          // Allow student to set status to 'suspicious' only when auto-submitting
+                          (
+                            request.resource.data.status == 'completed' ||
+                            request.resource.data.status == 'answered' ||
+                            request.resource.data.status == 'graded' ||
+                            (request.resource.data.status == 'suspicious' && request.resource.data.autoSubmitted == true)
+                          )
+                        )
+                      );
+
+      // Allow students to list their own submissions (e.g., for a dashboard).
+      // Allow faculty or super-admin to list all submissions.
+      allow list: if isSignedIn() && (isFaculty() || isSuperAdmin() || request.query.where.get('studentId') == request.auth.uid);
+      
+      // No one can delete a submission record directly.
+      allow delete: if false;
+    }
+  }
+}
